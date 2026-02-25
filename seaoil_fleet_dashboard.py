@@ -1,13 +1,14 @@
 import streamlit as st
 import requests
 import re
+import pandas as pd
 from geopy.distance import geodesic
 import folium
 from streamlit_folium import st_folium
 
 GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
-# Your raw list (formatted into the system)
+# Your verified list
 RAW_BRANCHES = [
     "MERVILLE - PARANAQUE", "CALAUAN - LAGUNA", "55 C VIRA LAOAG - ILOCOS NORTE", "A BONI - QC",
     "AGUITAP SOLSONA - ILOCOS NORTE", "TANAYTAY ALAMINOS - PANGASINAN", "ALAMINOS - LAGUNA",
@@ -80,70 +81,132 @@ RAW_BRANCHES = [
     "PALIGUI APALIT - PAMPANGA", "EDSA - QC", "DAGAT DAGATAN - CALOOCAN"
 ]
 
-st.set_page_config(page_title="Seaoil Fleet Dashboard", layout="wide")
+st.set_page_config(page_title="Seaoil Fleet Intelligence", layout="wide")
 
-# --- Helper Functions ---
+# Initialize session state so results persist
+if 'analysis_results' not in st.session_state:
+    st.session_state.analysis_results = None
+
+# --- Logic Functions ---
 
 def parse_coords(url):
     regex = r"@(-?\d+\.\d+),(-?\d+\.\d+)"
     match = re.search(regex, url)
     return (float(match.group(1)), float(match.group(2))) if match else None
 
+def get_distance_data(origin_coords, destinations):
+    """Calls Google Distance Matrix API for real-world travel times."""
+    dest_strings = [f"{d['coords'][0]},{d['coords'][1]}" for d in destinations]
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": f"{origin_coords[0]},{origin_coords[1]}",
+        "destinations": "|".join(dest_strings),
+        "key": GOOGLE_API_KEY
+    }
+    data = requests.get(url, params=params).json()
+    
+    results = []
+    if data['status'] == 'OK':
+        elements = data['rows'][0]['elements']
+        for i, element in enumerate(elements):
+            if element['status'] == 'OK':
+                results.append({
+                    "distance_text": element['distance']['text'],
+                    "duration_text": element['duration']['text']
+                })
+            else:
+                results.append({"distance_text": "N/A", "duration_text": "N/A"})
+    return results
+
 def get_top_seaoil(coords):
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {"query": "SEAOIL", "location": f"{coords[0]},{coords[1]}", "radius": 15000, "key": GOOGLE_API_KEY}
-    results = requests.get(url, params=params).json().get("results", [])
+    raw_results = requests.get(url, params=params).json().get("results", [])
     
     scored = []
-    for s in results:
+    for s in raw_results:
         s_name = s['name'].upper()
         s_coords = (s['geometry']['location']['lat'], s['geometry']['location']['lng'])
-        dist = geodesic(coords, s_coords).km
+        dist_air = geodesic(coords, s_coords).km
         
-        # Checking if it matches your "SEAOIL - ADDRESS" naming
+        # Verify if it's in your provided branch list
         is_verified = any(branch.split(" - ")[0] in s_name for branch in RAW_BRANCHES)
         
         score = 0
-        if is_verified: score += 70  # Higher weight for your provided list
-        if dist <= 5: score += 20
-        if "HIGHWAY" in s.get('formatted_address', '').upper(): score += 10
+        if is_verified: score += 70
+        if dist_air <= 5: score += 20
         
         scored.append({
-            "name": s['name'], "addr": s.get('formatted_address', ''),
-            "dist": round(dist, 2), "score": score, "coords": s_coords
+            "name": f"SEAOIL - {s['name'].replace('Seaoil', '').replace('-', '').strip()}",
+            "addr": s.get('formatted_address', ''),
+            "dist_air": round(dist_air, 2),
+            "score": score,
+            "coords": s_coords
         })
     
-    return sorted(scored, key=lambda x: (-x['score'], x['dist']))[:6]
+    top_6 = sorted(scored, key=lambda x: (-x['score'], x['dist_air']))[:6]
+    
+    # Enrich with Distance Matrix
+    dist_matrix = get_distance_data(coords, top_6)
+    for i, item in enumerate(dist_matrix):
+        top_6[i]['real_dist'] = item['distance_text']
+        top_6[i]['duration'] = item['duration_text']
+        
+    return top_6
 
-# --- UI Layout ---
+# --- UI ---
 
 st.title("Seaoil Strategic Mapping Tool")
 url_input = st.text_input("Paste Google Maps URL (@lat,long)")
 
-if st.button("Analyze Fleet Proximity") and url_input:
-    client_coords = parse_coords(url_input)
-    if client_coords:
-        stations = get_top_seaoil(client_coords)
-        
-        # Map
-        m = folium.Map(location=client_coords, zoom_start=12)
-        folium.Marker(client_coords, icon=folium.Icon(color='red', icon='building', prefix='fa')).add_to(m)
-        for s in stations:
-            folium.Marker(s['coords'], tooltip=f"{s['name']} ({s['dist']}km)").add_to(m)
-        st_folium(m, width="100%", height=450)
-        
-        # Results Cards
-        st.subheader("Top Recommended Verified Stations")
-        cols = st.columns(2)
-        for idx, s in enumerate(stations):
-            with cols[idx % 2]:
-                st.markdown(f"""
-                <div style="border:1px solid #ddd; padding:15px; border-radius:10px; margin-bottom:10px;">
-                    <h4 style="color:#003399;">{s['name']}</h4>
-                    <p style="font-size:0.9em;">{s['addr']}</p>
-                    <b>Distance:</b> {s['dist']} km | <b>Score:</b> {s['score']}/100
-                </div>
-                """, unsafe_allow_html=True)
-                st.image(f"https://maps.googleapis.com/maps/api/streetview?size=600x300&location={s['coords'][0]},{s['coords'][1]}&key={GOOGLE_API_KEY}")
+if st.button("Analyze Fleet Proximity"):
+    coords = parse_coords(url_input)
+    if coords:
+        with st.spinner("Calculating Distance Matrix & Fetching Stations..."):
+            st.session_state.analysis_results = {
+                "client_coords": coords,
+                "stations": get_top_seaoil(coords)
+            }
     else:
-        st.error("Could not find coordinates. Ensure the URL contains the @ symbol followed by numbers.")
+        st.error("Invalid URL. Ensure it contains the @lat,long coordinates.")
+
+# Display results if they exist in state
+if st.session_state.analysis_results:
+    res = st.session_state.analysis_results
+    client_coords = res["client_coords"]
+    stations = res["stations"]
+
+    # 1. THE MAP (Fixed with unique key to prevent flashing)
+    m = folium.Map(location=client_coords, zoom_start=12)
+    folium.Marker(client_coords, icon=folium.Icon(color='red', icon='briefcase', prefix='fa'), tooltip="CLIENT").add_to(m)
+    for s in stations:
+        folium.Marker(s['coords'], tooltip=s['name'], icon=folium.Icon(color='blue', icon='gas-pump', prefix='fa')).add_to(m)
+    
+    st_folium(m, width="100%", height=500, key="stable_map")
+
+    # 2. DISTANCE MATRIX TABLE
+    st.subheader("📊 Strategic Distance Matrix")
+    matrix_data = []
+    for s in stations:
+        matrix_data.append({
+            "Station Name": s['name'],
+            "Travel Distance": s['real_dist'],
+            "Estimated Time": s['duration'],
+            "Straight-Line (km)": s['dist_air'],
+            "Strategic Score": f"{s['score']}/100"
+        })
+    st.table(pd.DataFrame(matrix_data))
+
+    # 3. LOCATION CARDS & STREET VIEW
+    st.subheader("📍 Detailed Station Profiles")
+    cols = st.columns(2)
+    for idx, s in enumerate(stations):
+        with cols[idx % 2]:
+            st.markdown(f"""
+            <div style="border:1px solid #ddd; padding:15px; border-radius:10px; margin-bottom:10px; background-color: #f9f9f9;">
+                <h4 style="color:#003399; margin-bottom:2px;">{s['name']}</h4>
+                <p style="font-size:0.85em; color:gray;">{s['addr']}</p>
+                <b>Real Distance:</b> {s['real_dist']} | <b>Travel Time:</b> {s['duration']}
+            </div>
+            """, unsafe_allow_html=True)
+            st.image(f"https://maps.googleapis.com/maps/api/streetview?size=600x300&location={s['coords'][0]},{s['coords'][1]}&key={GOOGLE_API_KEY}")
